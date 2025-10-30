@@ -29,17 +29,13 @@ def load_csv(path: str) -> pd.DataFrame:
 def add_adjust_features(df: pd.DataFrame, which: str) -> tuple[pd.DataFrame, list[str]]:
     log(f"15) ADD/ADJUST ({which}): Creating features (FamilySize, IsAlone, Title).")
 
-    # Ensure required base columns exist
     for col in ["SibSp", "Parch"]:
         if col not in df.columns:
             df[col] = 0
-            log(f"Added missing column '{col}' with zeros.")
 
-    # Family-based features
     df["FamilySize"] = df["SibSp"].fillna(0) + df["Parch"].fillna(0) + 1
     df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
 
-    # Title from Name
     if "Name" in df.columns:
         df["Title"] = (
             df["Name"].fillna("")
@@ -49,21 +45,14 @@ def add_adjust_features(df: pd.DataFrame, which: str) -> tuple[pd.DataFrame, lis
         )
     else:
         df["Title"] = "Unknown"
-        log("Column 'Name' not found; setting Title='Unknown'.")
 
-    # Features we will use
     features = [
-        # numeric
-        "Pclass", "Age", "SibSp", "Parch", "Fare", "FamilySize", "IsAlone",
-        # categorical
-        "Sex", "Embarked", "Title",
+        "Pclass","Age","SibSp","Parch","Fare","FamilySize","IsAlone",
+        "Sex","Embarked","Title",
     ]
-
-    # Create placeholder columns if missing so the pipeline can impute
     for c in features:
         if c not in df.columns:
             df[c] = np.nan
-            log(f"Added missing column '{c}' as NaN placeholder.")
 
     log(f"Using features: {features}")
     return df, features
@@ -73,14 +62,12 @@ def build_pipeline(numeric_features: list[str], categorical_features: list[str])
     log("Building preprocessing + LogisticRegression pipeline.")
     numeric_pipe = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
-        # with_mean=False keeps sparse compatibility when combined with OneHot
         ("scaler", StandardScaler(with_mean=False)),
     ])
     categorical_pipe = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("onehot", OneHotEncoder(handle_unknown="ignore")),
     ])
-
     pre = ColumnTransformer(
         transformers=[
             ("num", numeric_pipe, numeric_features),
@@ -89,13 +76,8 @@ def build_pipeline(numeric_features: list[str], categorical_features: list[str])
         remainder="drop",
         sparse_threshold=1.0,
     )
-
     clf = LogisticRegression(max_iter=1000, solver="liblinear")
-
-    return Pipeline(steps=[
-        ("preprocess", pre),
-        ("logreg", clf),
-    ])
+    return Pipeline(steps=[("preprocess", pre), ("logreg", clf)])
 
 
 def fit_and_report(pipe: Pipeline, X: pd.DataFrame, y: pd.Series, label: str) -> Pipeline:
@@ -118,70 +100,42 @@ def main(args):
     if not os.path.exists(test_path):
         log(f"ERROR: {test_path} not found."); sys.exit(1)
 
-    # Load
     train_df = load_csv(train_path)
     test_df  = load_csv(test_path)
 
     if "Survived" not in train_df.columns:
         log("ERROR: TRAIN must contain 'Survived' column."); sys.exit(1)
 
-    # 15) Feature engineering
+    # 15) Features
     train_df, features = add_adjust_features(train_df, which="TRAIN")
     test_df,  _        = add_adjust_features(test_df,  which="TEST")
 
-    # Split X/y
+    # Build pipeline
     X_train = train_df[features]
     y_train = train_df["Survived"].astype(int)
-
-    # Build pipeline
     num_feats = X_train.select_dtypes(include=[np.number]).columns.tolist()
     cat_feats = [c for c in features if c not in num_feats]
     log(f"Numeric features: {num_feats}")
     log(f"Categorical features: {cat_feats}")
-
     pipe = build_pipeline(num_feats, cat_feats)
 
-    # 16) Fit & training accuracy
+    # 16) Train accuracy
     pipe = fit_and_report(pipe, X_train, y_train, label="TRAIN")
 
-    # 17–18) Predict on TEST; measure accuracy only if labels exist
+    # 17) Predict TEST → save file
     X_test = test_df[features]
-    if "Survived" in test_df.columns:
-        y_test = test_df["Survived"].astype(int)
-        log("17) PREDICT: Generating predictions for TEST with labels.")
-        preds = pipe.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-        cm = confusion_matrix(y_test, preds)
-        log(f"18) ACCURACY (TEST): {acc:.4f}")
-        log(f"TEST Confusion Matrix:\n{cm}")
-    else:
-        log("17) PREDICT: TEST has no 'Survived' column. Producing predictions only.")
-        preds = pipe.predict(X_test)
-        log(f"Sample predictions (first 10): {list(map(int, preds[:10]))}")
-    
-        # Try loading gender_submission.csv to evaluate test accuracy
-        gender_path = os.path.join(args.data_dir, "gender_submission.csv")
-        if os.path.exists(gender_path):
-            log(f"Found gender_submission.csv: {gender_path}")
-            gender_df = pd.read_csv(gender_path)
-            if "Survived" in gender_df.columns:
-                # Align on PassengerId to ensure order matches
-                merged = pd.merge(
-                    test_df[["PassengerId"]].copy(),
-                    gender_df[["PassengerId", "Survived"]],
-                    on="PassengerId",
-                    how="inner"
-                )
-                true_y = merged["Survived"].astype(int)
-                pred_y = preds[:len(true_y)]
-                acc = accuracy_score(true_y, pred_y)
-                cm = confusion_matrix(true_y, pred_y)
-                log(f"18) ACCURACY (TEST via gender_submission): {acc:.4f}")
-                log(f"TEST Confusion Matrix:\n{cm}")
-            else:
-                log("gender_submission.csv found, but no 'Survived' column.")
-        else:
-            log("18) ACCURACY: Skipped because TEST has no labels or gender_submission.csv.")
+    preds = pipe.predict(X_test).astype(int)
+    os.makedirs("outputs", exist_ok=True)
+    out_path = "outputs/submission_python.csv"
+    pd.DataFrame(
+        {"PassengerId": test_df["PassengerId"], "Survived": preds}
+    ).to_csv(out_path, index=False)
+    log(f"17) PREDICT: Wrote predictions to {out_path}")
+
+    # 18) Per instructor: skip test accuracy
+    log("18) ACCURACY (TEST): Skipped per instructions (save predictions only).")
+
+    log("DONE.")
 
 
 if __name__ == "__main__":

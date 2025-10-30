@@ -1,200 +1,120 @@
-# src/run/model.R
-suppressPackageStartupMessages({
-  library(readr)
-  library(dplyr)
-  library(stringr)
-  library(caret)
-})
-
-BANNER <- paste(rep("=", 72), collapse = "")
-
-log_msg <- function(msg) {
+# src/R_run/model.R
+slog <- function(msg) {
   cat(sprintf("[%s] %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg))
   flush.console()
 }
 
-get_arg <- function(flag = "--data_dir", default = "src/data") {
-  args <- commandArgs(trailingOnly = TRUE)
-  hit  <- which(args == flag)
-  if (length(hit) == 1 && length(args) >= hit + 1) return(args[hit + 1])
-  default
-}
+args <- commandArgs(trailingOnly = TRUE)
+data_dir <- "src/data"
+if (length(args) >= 2 && args[1] == "--data_dir") data_dir <- args[2]
 
-safe_read_csv <- function(path) {
-  log_msg(paste0("Loading file: ", path))
-  df <- readr::read_csv(path, show_col_types = FALSE, progress = FALSE)
-  log_msg(paste0("Loaded shape: (", nrow(df), ", ", ncol(df), ")"))
-  df
-}
+train_path  <- file.path(data_dir, "train.csv")
+test_path   <- file.path(data_dir, "test.csv")
 
-add_adjust_features <- function(df, is_train = TRUE) {
-  log_msg("15) ADD/ADJUST: Creating features (FamilySize, IsAlone, Title).")
+# ---- Load ----
+slog(paste("Loading file:", train_path))
+suppressWarnings({
+  train <- tryCatch(data.table::fread(train_path), error = function(e) read.csv(train_path))
+})
+slog(paste("Loaded shape:", sprintf("(%d, %d)", nrow(train), ncol(train))))
 
-  # Ensure SibSp/Parch exist (placeholders if missing)
-  if (!"SibSp" %in% names(df)) {
-    df$SibSp <- 0L
-    log_msg("Added missing column 'SibSp' = 0 (placeholder).")
-  }
-  if (!"Parch" %in% names(df)) {
-    df$Parch <- 0L
-    log_msg("Added missing column 'Parch' = 0 (placeholder).")
-  }
+slog(paste("Loading file:", test_path))
+suppressWarnings({
+  test  <- tryCatch(data.table::fread(test_path),  error = function(e) read.csv(test_path))
+})
+slog(paste("Loaded shape:", sprintf("(%d, %d)", nrow(test), ncol(test))))
 
-  # Family features
-  df <- df %>%
-    mutate(
-      FamilySize = coalesce(SibSp, 0) + coalesce(Parch, 0) + 1,
-      IsAlone    = as.integer(FamilySize == 1)
-    )
+if (!"Survived" %in% names(train)) stop("ERROR: TRAIN must contain 'Survived' column.")
 
-  # Title from Name
+# ---- 15) Feature engineering ----
+add_feats <- function(df, which="DATA") {
+  slog(sprintf("15) ADD/ADJUST (%s): Creating features (FamilySize, IsAlone, Title).", which))
+  if (!"SibSp" %in% names(df)) df$SibSp <- 0L
+  if (!"Parch" %in% names(df)) df$Parch <- 0L
+
+  df$FamilySize <- ifelse(is.na(df$SibSp), 0, df$SibSp) +
+                   ifelse(is.na(df$Parch), 0, df$Parch) + 1L
+  df$IsAlone <- as.integer(df$FamilySize == 1L)
+
   if ("Name" %in% names(df)) {
-    extracted <- str_match(coalesce(df$Name, ""), ",\\s*([^\\.]+)\\.")
-    df$Title  <- ifelse(is.na(extracted[, 2]), "Unknown", str_trim(extracted[, 2]))
-  } else {
-    df$Title <- "Unknown"
-    log_msg("Column 'Name' not found; setting Title='Unknown'.")
+    m <- regexec(",\\s*([^\\.]+)\\.", df$Name)
+    ext <- regmatches(df$Name, m)
+    df$Title <- vapply(ext, function(x) if (length(x) >= 2) trimws(x[2]) else "Unknown", character(1))
+  } else df$Title <- "Unknown"
+
+  needed <- c("Pclass","Age","SibSp","Parch","Fare","FamilySize","IsAlone","Sex","Embarked","Title")
+  for (c in needed) if (!c %in% names(df)) df[[c]] <- NA
+
+  med_or <- function(x) {
+    x <- as.numeric(x)
+    if (all(is.na(x))) { x[is.na(x)] <- 0; return(x) }
+    m <- stats::median(x, na.rm = TRUE)
+    x[is.na(x)] <- m
+    x
   }
+  if ("Age" %in% names(df))  df$Age  <- med_or(df$Age)
+  if ("Fare"%in% names(df))  df$Fare <- med_or(df$Fare)
+  for (c in c("Pclass","SibSp","Parch","FamilySize","IsAlone")) if (c %in% names(df)) df[[c]] <- as.numeric(df[[c]])
 
-  # Candidate features
-  candidate_features <- c(
-    # numeric
-    "Pclass", "Age", "SibSp", "Parch", "Fare", "FamilySize", "IsAlone",
-    # categorical
-    "Sex", "Embarked", "Title"
-  )
-
-  # Ensure all candidate columns exist
-  for (c in candidate_features) {
-    if (!c %in% names(df)) {
-      df[[c]] <- NA
-      log_msg(paste0("Added missing column '", c, "' as NA (placeholder)."))
-    }
+  # normalize rare titles + align later
+  normalize_titles <- function(x) {
+    x <- as.character(x)
+    x[x %in% c("Mlle","Ms")] <- "Miss"
+    x[x == "Mme"] <- "Mrs"
+    rare <- c("Lady","Countess","Capt","Col","Don","Dr","Major","Rev","Sir","Jonkheer","Dona")
+    x[x %in% rare] <- "Rare"
+    factor(x)
   }
+  df$Title <- normalize_titles(df$Title)
 
-  log_msg(paste0("Using features: ", paste(candidate_features, collapse = ", ")))
-  list(df = df, features = candidate_features)
-}
-
-prep_medians <- function(df, num_cols) {
-  vapply(num_cols, function(col) median(df[[col]], na.rm = TRUE), numeric(1))
-}
-
-impute_numeric <- function(df, medians) {
-  for (col in names(medians)) {
-    if (!col %in% names(df)) next
-    df[[col]][is.na(df[[col]])] <- medians[[col]]
+  if ("Embarked" %in% names(df)) {
+    mode_emb <- names(sort(table(df$Embarked), decreasing=TRUE))[1]
+    df$Embarked[is.na(df$Embarked) | df$Embarked==""] <- mode_emb
   }
+  df$Sex      <- factor(df$Sex)
+  df$Embarked <- factor(df$Embarked)
+  df$Title    <- factor(df$Title)
   df
 }
 
-prep_categoricals <- function(df, cat_cols) {
-  for (c in cat_cols) {
-    if (!c %in% names(df)) next
-    df[[c]] <- as.character(df[[c]])
-    df[[c]][is.na(df[[c]]) | df[[c]] == ""] <- "Missing"
-    df[[c]] <- as.factor(df[[c]])
-  }
-  df
+train <- add_feats(train, "TRAIN")
+test  <- add_feats(test,  "TEST")
+
+# Align factor levels: make TEST use TRAIN's levels
+align_to_train <- function(x, train_levels) {
+  x <- as.character(x)
+  x[!(x %in% train_levels)] <- train_levels[1]
+  factor(x, levels = train_levels)
 }
+test$Sex      <- align_to_train(test$Sex,      levels(train$Sex))
+test$Embarked <- align_to_train(test$Embarked, levels(train$Embarked))
+test$Title    <- align_to_train(test$Title,    levels(train$Title))
 
-one_hot_fit <- function(df, features) {
-  # Build dummy encoder on training features only
-  dv <- caret::dummyVars(~ ., data = df[, features, drop = FALSE], fullRank = FALSE)
-  dv
-}
+features <- c("Pclass","Age","SibSp","Parch","Fare","FamilySize","IsAlone","Sex","Embarked","Title")
+slog(paste("Using features:", paste(features, collapse=", ")))
 
-one_hot_apply <- function(dv, df) {
-  as.data.frame(predict(dv, newdata = df))
-}
+# ---- 16) Fit GLM on TRAIN and report accuracy ----
+form <- as.formula(paste("Survived ~", paste(features, collapse=" + ")))
+slog("Building GLM (logistic regression).")
+fit <- glm(form, data=train, family=binomial())
 
-train_glm <- function(X, y) {
-  # y must be factor with levels 0/1 (or numeric 0/1)
-  dat <- cbind.data.frame(Survived = y, X)
-  # Use glm binomial
-  glm(Survived ~ ., data = dat, family = binomial())
-}
+pred_train <- as.integer(predict(fit, newdata=train, type="response") >= 0.5)
+acc_train  <- mean(pred_train == train$Survived)
+cm_train   <- table(Truth=train$Survived, Pred=pred_train)
+slog(sprintf("16) ACCURACY (TRAIN): %.4f", acc_train))
+slog("TRAIN Confusion Matrix:")
+print(cm_train)
 
-predict_class <- function(model, X, threshold = 0.5) {
-  p <- as.numeric(predict(model, newdata = X, type = "response"))
-  as.integer(p >= threshold)
-}
+# ---- 17) Predict TEST and save CSV ----
+pred_test <- as.integer(predict(fit, newdata=test, type="response") >= 0.5)
+if (!dir.exists("outputs")) dir.create("outputs", recursive = TRUE)
+out_path <- "outputs/submission_r.csv"
+utils::write.csv(
+  data.frame(PassengerId = test$PassengerId, Survived = pred_test),
+  out_path, row.names = FALSE
+)
+slog(paste("17) PREDICT: Wrote predictions to", out_path))
 
-accuracy <- function(y_true, y_pred) {
-  mean(as.integer(y_true) == as.integer(y_pred))
-}
-
-main <- function() {
-  data_dir <- get_arg("--data_dir", "src/data")
-  train_path <- file.path(data_dir, "train.csv")
-  test_path  <- file.path(data_dir, "test.csv")
-
-  if (!file.exists(train_path)) stop(paste("ERROR:", train_path, "not found."))
-  if (!file.exists(test_path))  stop(paste("ERROR:", test_path, "not found."))
-
-  train <- safe_read_csv(train_path)
-  test  <- safe_read_csv(test_path)
-
-  if (!"Survived" %in% names(train)) stop("ERROR: TRAIN must contain 'Survived' column.")
-
-  # 15) Add/Adjust features
-  aa_train <- add_adjust_features(train, is_train = TRUE)
-  train    <- aa_train$df
-  features <- aa_train$features
-
-  aa_test <- add_adjust_features(test, is_train = FALSE)
-  test    <- aa_test$df
-
-  # Split X/y
-  X_train <- train[, features, drop = FALSE]
-  y_train <- as.integer(train$Survived)
-
-  # Identify numeric vs categorical
-  num_cols <- c("Pclass", "Age", "SibSp", "Parch", "Fare", "FamilySize", "IsAlone")
-  cat_cols <- setdiff(features, num_cols)
-
-  # Impute numeric by train medians
-  medians <- prep_medians(X_train, num_cols)
-  X_train <- impute_numeric(X_train, medians)
-  X_test  <- test[, features, drop = FALSE]
-  X_test  <- impute_numeric(X_test, medians)
-
-  # Prepare categoricals (NA -> "Missing", as.factor)
-  X_train <- prep_categoricals(X_train, cat_cols)
-  X_test  <- prep_categoricals(X_test,  cat_cols)
-
-  # One-hot encode (fit on train, apply to both)
-  dv <- one_hot_fit(X_train, features)
-  Xtr <- one_hot_apply(dv, X_train)
-  Xte <- one_hot_apply(dv, X_test)
-
-  # 16) Fit & training accuracy
-  log_msg("Fitting Logistic Regression on TRAIN...")
-  model <- train_glm(Xtr, y_train)
-  yhat_train <- predict_class(model, Xtr, threshold = 0.5)
-  acc_train  <- accuracy(y_train, yhat_train)
-  log_msg(sprintf("16) ACCURACY (TRAIN): %.4f", acc_train))
-  log_msg("TRAIN Confusion Matrix:")
-  print(table(Truth = y_train, Pred = yhat_train))
-
-  # 17 & 18) Predict & evaluate on TEST (if labels exist)
-  if ("Survived" %in% names(test)) {
-    log_msg("17) PREDICT: Generating predictions for TEST set with labels present.")
-    y_test <- as.integer(test$Survived)
-    yhat_test <- predict_class(model, Xte, threshold = 0.5)
-    acc_test  <- accuracy(y_test, yhat_test)
-    log_msg(sprintf("18) ACCURACY (TEST): %.4f", acc_test))
-    log_msg("TEST Confusion Matrix:")
-    print(table(Truth = y_test, Pred = yhat_test))
-  } else {
-    log_msg("17) PREDICT: TEST has no 'Survived' column. Producing predictions only.")
-    yhat_test <- predict_class(model, Xte, threshold = 0.5)
-    log_msg(paste0("Sample predictions (first 10): ", paste(head(yhat_test, 10), collapse = ", ")))
-    log_msg("18) ACCURACY: Skipped because TEST has no labels.")
-  }
-
-  log_msg("DONE.")
-}
-
-# Run
-main()
+# ---- 18) Per instructor: skip test accuracy ----
+slog("18) ACCURACY (TEST): Skipped per instructions (save predictions only).")
+slog("DONE.")
