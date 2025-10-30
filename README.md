@@ -15,25 +15,24 @@ Train a logistic regression model on the training data
 Save predictions for the test data to outputs/
 
 ## Repository Structure
-titanic-disaster-prediction-tde/
-├── src/
-│   ├── data/                
-│   │   ├── train.csv
-│   │   ├── test.csv
-│   │   └── gender_submission.csv
-│   ├── run/                   
-│   │   └── model.py
-│   └── R_run/                  
-│       ├── model.R
-│       ├── install_packages.R
-│       └── Dockerfile
-├── outputs/                   
-│   ├── submission_python.csv
-│   └── submission_r.csv
-├── Dockerfile                
-├── requirements.txt          
-├── .gitignore
-└── README.md
+- **src/**
+  - **data/** → Local dataset folder *(not tracked in GitHub)*
+    - `train.csv`
+    - `test.csv`
+    - `gender_submission.csv`
+  - **run/** → Python implementation
+    - `model.py`
+  - **R_run/** → R implementation
+    - `model.R`
+    - `install_packages.R`
+    - `Dockerfile`
+- **outputs/** → Generated predictions
+  - `submission_python.csv`
+  - `submission_r.csv`
+- **Dockerfile** → Python container configuration
+- **requirements.txt** → Python dependencies
+- **.gitignore** → Prevents data and system files from being committed
+- **README.md** → Project documentation
 
 ## Data Source
 
@@ -88,7 +87,7 @@ If your data was already copied into the image during build:
 docker run --rm titanic-logreg
 
 
-## What happens:
+### What happens:
 
 The script trains a logistic regression model.
 
@@ -116,7 +115,7 @@ If the data was already included in the image:
 docker run --rm titanic-r
 
 
-What happens:
+### What happens:
 
 The R script loads the Titanic data.
 
